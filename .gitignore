@@ -1,0 +1,34 @@
+# Python environments and caches
+.venv/
+zed_env/
+__pycache__/
+*.py[cod]
+.analysis/
+.vscode/
+build/
+dist/
+
+# Local application state
+.studio_settings.json
+studio_errors.log
+
+# Camera recordings and generated OpenSim results
+recordings/
+test_data/
+motion_data.json
+legacy_scripts/*.json
+legacy_scripts/
+*.mp4
+*.svo
+*.svo2
+*.log
+
+# Local OpenSim example-model checkout; required meshes are bundled separately.
+opensim-models/
+assets/workflow-diagram.png
+
+# Editors and OS metadata
+.idea/
+.DS_Store
+Thumbs.db
+
