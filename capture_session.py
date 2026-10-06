@@ -37,8 +37,10 @@ class CaptureSession(threading.Thread):
         locked_id = None
         last_success = time.monotonic()
         try:
+            self.events.put(("camera_status", "正在載入 ZED SDK…"))
             import pyzed.sl as sl
             from capture_to_trc import MARKER_TO_KEYPOINT_INDEX, SKELETON_BONES, to_opensim_axes
+            self.events.put(("camera_status", f"ZED SDK {sl.Camera.get_sdk_version()} 已載入，正在開啟相機…"))
             camera = sl.Camera()
             init = sl.InitParameters()
             init.coordinate_units = sl.UNIT.METER
@@ -49,10 +51,12 @@ class CaptureSession(threading.Thread):
             status = camera.open(init)
             if status != sl.ERROR_CODE.SUCCESS:
                 raise RuntimeError(f"無法開啟 ZED 相機：{status}")
+            self.events.put(("camera_status", "相機已開啟，正在啟用位置追蹤…"))
             status = camera.enable_positional_tracking(sl.PositionalTrackingParameters())
             if status != sl.ERROR_CODE.SUCCESS:
                 raise RuntimeError(f"無法啟用位置追蹤：{status}")
             positional = True
+            self.events.put(("camera_status", "位置追蹤已啟用，正在載入人體追蹤 AI…"))
             params = sl.BodyTrackingParameters()
             params.enable_tracking = True
             params.enable_body_fitting = True
@@ -62,6 +66,7 @@ class CaptureSession(threading.Thread):
             if status != sl.ERROR_CODE.SUCCESS:
                 raise RuntimeError(f"無法啟用人體追蹤：{status}")
             tracking = True
+            self.events.put(("camera_status", "人體追蹤 AI 已啟用，正在等待影像…"))
             runtime = sl.RuntimeParameters()
             runtime.measure3D_reference_frame = sl.REFERENCE_FRAME.CAMERA
             body_runtime = sl.BodyTrackingRuntimeParameters()

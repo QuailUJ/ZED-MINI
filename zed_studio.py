@@ -2,6 +2,7 @@
 import bisect
 import ctypes
 from datetime import datetime
+import faulthandler
 import json
 import os
 from pathlib import Path
@@ -27,6 +28,40 @@ from voice_control import VoiceControl
 
 RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 PROJECT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else RESOURCE_DIR
+DIAGNOSTIC_LOG = PROJECT / "studio_diagnostics.log"
+_FAULT_STREAM = None
+
+
+def diagnostic(message):
+    try:
+        with DIAGNOSTIC_LOG.open("a", encoding="utf-8") as stream:
+            stream.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}\n")
+    except OSError:
+        pass
+
+
+def install_crash_logging():
+    """Keep useful evidence when a windowed build exits without a console."""
+    global _FAULT_STREAM
+    try:
+        _FAULT_STREAM = DIAGNOSTIC_LOG.open("a", encoding="utf-8", buffering=1)
+        faulthandler.enable(_FAULT_STREAM, all_threads=True)
+    except (OSError, RuntimeError):
+        _FAULT_STREAM = None
+
+    def unhandled(exc_type, exc_value, exc_tb):
+        diagnostic("Unhandled exception")
+        try:
+            with DIAGNOSTIC_LOG.open("a", encoding="utf-8") as stream:
+                traceback.print_exception(exc_type, exc_value, exc_tb, file=stream)
+        except OSError:
+            pass
+
+    def thread_unhandled(args):
+        unhandled(args.exc_type, args.exc_value, args.exc_traceback)
+
+    sys.excepthook = unhandled
+    threading.excepthook = thread_unhandled
 
 
 def play_cue(kind):
@@ -446,6 +481,8 @@ class Studio(tk.Tk):
             self.after(50, self.start_voice)
         if auto_connect:
             self.after(150, self.connect)
+        else:
+            self.status.set("安全模式：未自動啟動相機與語音；介面穩定後可手動按「連接相機」。")
 
     def start_voice(self):
         if self.closing or not self.voice_enabled.get() or (self.voice is not None and self.voice.is_alive()):
@@ -489,6 +526,7 @@ class Studio(tk.Tk):
 
     def report_callback_exception(self, exc_type, exc_value, exc_tb):
         self.status.set(f"操作未完成：{exc_value}。介面仍可繼續使用。")
+        diagnostic(f"GUI callback failed: {exc_value}")
         try:
             with (PROJECT / "studio_errors.log").open("a", encoding="utf-8") as stream:
                 traceback.print_exception(exc_type, exc_value, exc_tb, file=stream)
@@ -566,6 +604,7 @@ class Studio(tk.Tk):
                 save_json(session_metadata_path(self.session), {"version": 1, "name": self.session.name, "calibration": None})
         self.camera = CaptureSession(self.events)
         self.camera.start()
+        diagnostic("Camera worker started")
         self.status.set("正在初始化 ZED 與人體追蹤…")
         self.update_controls()
 
@@ -749,7 +788,11 @@ class Studio(tk.Tk):
             self.update_controls()
 
     def handle_event(self, event, value):
-        if event == "camera_ready":
+        if event == "camera_status":
+            diagnostic(value)
+            self.status.set(value)
+        elif event == "camera_ready":
+            diagnostic("Camera and body tracking ready")
             self.camera_ready = True
             self.status.set("相機已就緒，請建立工作階段並先錄製靜態站姿。")
         elif event == "recording":
@@ -784,6 +827,7 @@ class Studio(tk.Tk):
             else:
                 self.status.set(f"錄製已中止，資料保留於 {directory}")
         elif event in ("camera_error", "error"):
+            diagnostic(f"{event}: {value}")
             self.status.set(value)
             if event == "camera_error":
                 self.camera_ready = False
@@ -874,4 +918,8 @@ if __name__ == "__main__":
         from run_pipeline import main as pipeline_main
         pipeline_main()
     else:
-        Studio().mainloop()
+        install_crash_logging()
+        safe_mode = "--safe-mode" in sys.argv or Path(sys.executable).stem.lower().endswith("_safemode")
+        diagnostic(f"Application start; safe_mode={safe_mode}; executable={sys.executable}")
+        Studio(enable_voice=not safe_mode, auto_connect=not safe_mode).mainloop()
+        diagnostic("Application closed normally")

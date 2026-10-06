@@ -15,6 +15,8 @@
 
 已打包版本可直接執行 `ZED_MINI_Studio.exe`。EXE 採用資料夾模式，請保留旁邊的 `_internal` 目錄；錄製成果會建立在 EXE 同層的 `recordings`。
 
+若一般版本啟動後自行關閉，請改開 `ZED_MINI_Studio_SafeMode.exe`。安全模式不會自動初始化相機或語音，方便確認問題是否來自 ZED 人體追蹤；之後可手動按「連接相機」。診斷過程會寫入同層的 `studio_diagnostics.log`。
+
 若要從原始碼重新打包：
 
 ```powershell

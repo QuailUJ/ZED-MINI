@@ -35,8 +35,23 @@ exe = EXE(
     disable_windowed_traceback=False,
 )
 
+safe_exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name="ZED_MINI_Studio_SafeMode",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    console=False,
+    disable_windowed_traceback=False,
+)
+
 coll = COLLECT(
     exe,
+    safe_exe,
     a.binaries,
     a.datas,
     strip=False,
