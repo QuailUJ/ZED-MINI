@@ -302,7 +302,7 @@ class WorkerTests(unittest.TestCase):
         events = queue.Queue()
         with patch.object(sl, 'Camera', return_value=camera):
             CaptureSession(events).run()
-        camera.close.assert_called_once()
+        camera.close.assert_not_called()
         kinds = [events.get_nowait()[0] for _ in range(events.qsize())]
         self.assertIn('camera_error', kinds)
         self.assertEqual(kinds[-1], 'camera_closed')

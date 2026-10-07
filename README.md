@@ -13,7 +13,7 @@
 使用目前 `.venv` 的 Python、ZED SDK、OpenSim、OpenCV、Tkinter 與 Pillow。
 相機未連接時仍可閱讀內建教學。
 
-已打包版本可直接執行 `ZED_MINI_Studio.exe`。EXE 採用資料夾模式，請保留旁邊的 `_internal` 目錄；錄製成果會建立在 EXE 同層的 `recordings`。
+已打包版本可直接執行 `ZED_MINI_Studio.exe`。EXE 採用資料夾模式，請保留旁邊的 `_internal` 目錄；錄製成果會建立在 EXE 同層的 `recordings`。目前發佈版對應 **ZED SDK 5.5.0**，會自動使用電腦已安裝的 ZED、NVIDIA、CUDA 與 TensorRT 元件，不必手動輸入安裝路徑。
 
 若一般版本啟動後自行關閉，請改開 `ZED_MINI_Studio_SafeMode.exe`。安全模式不會自動初始化相機或語音，方便確認問題是否來自 ZED 人體追蹤；之後可手動按「連接相機」。診斷過程會寫入同層的 `studio_diagnostics.log`。
 
@@ -21,6 +21,7 @@
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe tools\prepare_zed55_build.py
 .\.venv\Scripts\pyinstaller.exe --noconfirm --clean ZED_MINI_Studio.spec
 ```
 
@@ -33,7 +34,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-`pyzed` 不在 `requirements.txt` 內，需先安裝 [ZED SDK](https://www.stereolabs.com/developers/release/) 及其 Python API。
+`pyzed` 不在 `requirements.txt` 內，需先安裝 [ZED SDK 5.5.0](https://www.stereolabs.com/developers/release/) 及其 Python API。程式預設從 ZED 安裝程式建立的 `ZED_SDK_ROOT_DIR` 取得原生元件；若環境變數不存在，才使用官方預設位置 `C:\Program Files (x86)\ZED SDK`。
 模型需要的 81 個幾何檔已精簡收錄於 `opensimPipeline/Geometry`，不需要另外下載整份 OpenSim 範例模型庫。
 
 第一次啟動會顯示五頁使用教學：操作順序、相機準備、靜態校正、動作錄製與回放。

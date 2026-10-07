@@ -1,5 +1,12 @@
 # ZED MINI 動作錄製工作室使用教學
 
+## 電腦需求
+
+- 安裝 ZED SDK **5.5.0**，並確認 ZED Depth Viewer 能顯示相機畫面。
+- 使用程式前關閉 ZED Depth Viewer，避免相機同時被兩個程式占用。
+- 程式會自動使用已安裝的 NVIDIA 驅動、CUDA 與 ZED SDK，不需要手動提供安裝路徑。
+- 請保留 `ZED_MINI_Studio.exe` 旁的 `_internal` 資料夾；不能只複製單一 EXE。
+
 ```mermaid
 flowchart LR
     A[新增或開啟工作階段] --> B[自動連接 ZED MINI]

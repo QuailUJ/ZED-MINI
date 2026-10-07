@@ -602,7 +602,7 @@ class Studio(tk.Tk):
             self.calibration_label.set("靜態校正：尚未完成")
             if self.session is not None:
                 save_json(session_metadata_path(self.session), {"version": 1, "name": self.session.name, "calibration": None})
-        self.camera = CaptureSession(self.events)
+        self.camera = CaptureSession(self.events, logger=diagnostic)
         self.camera.start()
         diagnostic("Camera worker started")
         self.status.set("正在初始化 ZED 與人體追蹤…")

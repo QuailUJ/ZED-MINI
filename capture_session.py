@@ -1,13 +1,35 @@
 """Own the ZED camera on one worker thread. GUI never calls SDK methods."""
+import os
 import queue
 import threading
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
 
 from motion_data import MARKER_ORDER
 from recording_io import RecordingWriter
+
+
+_DLL_DIRECTORIES = []
+
+
+def prepare_zed_sdk():
+    """Make the installed ZED SDK DLLs available to the bundled Python API."""
+    if os.name != "nt":
+        return None
+    sdk_root = Path(os.environ.get("ZED_SDK_ROOT_DIR", r"C:\Program Files (x86)\ZED SDK"))
+    bin_dir = sdk_root / "bin"
+    required = (bin_dir / "sl_zed64.dll", bin_dir / "sl_ai64.dll")
+    missing = [path.name for path in required if not path.is_file()]
+    if missing:
+        raise RuntimeError(
+            f"找不到 ZED SDK 元件：{', '.join(missing)}。"
+            "請安裝 ZED SDK 5.5.0，安裝完成後重新啟動程式。"
+        )
+    _DLL_DIRECTORIES.append(os.add_dll_directory(str(bin_dir)))
+    return sdk_root
 
 
 def select_body(bodies, locked_id=None):
@@ -17,7 +39,7 @@ def select_body(bodies, locked_id=None):
 
 
 class CaptureSession(threading.Thread):
-    def __init__(self, events, ready_seconds=0.5):
+    def __init__(self, events, ready_seconds=0.5, logger=None):
         super().__init__(daemon=False)
         self.events = events
         self.ready_seconds = ready_seconds
@@ -25,6 +47,12 @@ class CaptureSession(threading.Thread):
         self.stop_event = threading.Event()
         self.latest = None
         self.lock = threading.Lock()
+        self.logger = logger
+
+    def report_status(self, message):
+        if self.logger is not None:
+            self.logger(message)
+        self.events.put(("camera_status", message))
 
     def snapshot(self):
         with self.lock:
@@ -32,15 +60,19 @@ class CaptureSession(threading.Thread):
 
     def run(self):
         camera = None
+        opened = False
         writer = None
         positional = tracking = False
         locked_id = None
         last_success = time.monotonic()
         try:
-            self.events.put(("camera_status", "正在載入 ZED SDK…"))
+            self.report_status("正在載入 ZED SDK…")
+            sdk_root = prepare_zed_sdk()
+            if sdk_root is not None:
+                self.report_status(f"使用電腦已安裝的 ZED SDK：{sdk_root}")
             import pyzed.sl as sl
             from capture_to_trc import MARKER_TO_KEYPOINT_INDEX, SKELETON_BONES, to_opensim_axes
-            self.events.put(("camera_status", f"ZED SDK {sl.Camera.get_sdk_version()} 已載入，正在開啟相機…"))
+            self.report_status(f"ZED SDK {sl.Camera.get_sdk_version()} 已載入，正在開啟相機…")
             camera = sl.Camera()
             init = sl.InitParameters()
             init.coordinate_units = sl.UNIT.METER
@@ -51,12 +83,13 @@ class CaptureSession(threading.Thread):
             status = camera.open(init)
             if status != sl.ERROR_CODE.SUCCESS:
                 raise RuntimeError(f"無法開啟 ZED 相機：{status}")
-            self.events.put(("camera_status", "相機已開啟，正在啟用位置追蹤…"))
+            opened = True
+            self.report_status("相機已開啟，正在啟用位置追蹤…")
             status = camera.enable_positional_tracking(sl.PositionalTrackingParameters())
             if status != sl.ERROR_CODE.SUCCESS:
                 raise RuntimeError(f"無法啟用位置追蹤：{status}")
             positional = True
-            self.events.put(("camera_status", "位置追蹤已啟用，正在載入人體追蹤 AI…"))
+            self.report_status("位置追蹤已啟用，正在載入人體追蹤 AI…")
             params = sl.BodyTrackingParameters()
             params.enable_tracking = True
             params.enable_body_fitting = True
@@ -66,7 +99,7 @@ class CaptureSession(threading.Thread):
             if status != sl.ERROR_CODE.SUCCESS:
                 raise RuntimeError(f"無法啟用人體追蹤：{status}")
             tracking = True
-            self.events.put(("camera_status", "人體追蹤 AI 已啟用，正在等待影像…"))
+            self.report_status("人體追蹤 AI 已啟用，正在等待影像…")
             runtime = sl.RuntimeParameters()
             runtime.measure3D_reference_frame = sl.REFERENCE_FRAME.CAMERA
             body_runtime = sl.BodyTrackingRuntimeParameters()
@@ -158,7 +191,7 @@ class CaptureSession(threading.Thread):
                     directory = writer.finish("關閉介面，中止錄製")
                     self.events.put(("interrupted", str(directory)))
             finally:
-                if camera is not None:
+                if camera is not None and opened:
                     if tracking:
                         camera.disable_body_tracking()
                     if positional:
