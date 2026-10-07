@@ -6,7 +6,7 @@ from PyInstaller.utils.hooks import collect_all
 
 project_root = Path(SPECPATH)
 pyzed55 = project_root / ".analysis" / "pyzed55"
-if not pyzed55.is_dir():
+if not (pyzed55 / "pyzed-5.5.dist-info" / "METADATA").is_file():
     raise SystemExit("Missing .analysis/pyzed55. Run tools/prepare_zed55_build.py first.")
 sys.path.insert(0, str(pyzed55))
 
