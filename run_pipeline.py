@@ -240,6 +240,76 @@ def apply_front_facing_sagittal_correction(path):
     return path
 
 
+def foot_surfaces(model):
+    surfaces = []
+    for name in ("talus_r", "calcn_r", "toes_r", "talus_l", "calcn_l", "toes_l"):
+        body = model.getBodySet().get(name)
+        for index in range(body.getPropertyByName("attached_geometry").size()):
+            mesh = osim.Mesh.safeDownCast(body.get_attached_geometry(index))
+            path = GEOMETRY_DIR / Path(mesh.get_mesh_file()).name
+            data = ET.parse(path).find(".//Points/DataArray")
+            if data is None or data.get("format") != "ascii":
+                raise ValueError(f"無法讀取足部表面：{path.name}")
+            vertices = np.fromstring(data.text or "", sep=" ").reshape(-1, 3)
+            scale = np.array([mesh.get_scale_factors().get(i) for i in range(3)])
+            surfaces.append((mesh.getFrame(), vertices * scale))
+    if not surfaces:
+        raise ValueError("模型缺少足部表面")
+    return surfaces
+
+
+def foot_surface_height(state, surfaces):
+    heights = []
+    for frame, vertices in surfaces:
+        transform = frame.getTransformInGround(state)
+        y_axis = np.array([transform.R().get(1, i) for i in range(3)])
+        heights.append(float((vertices @ y_axis).min() + transform.p().get(1)))
+    return min(heights)
+
+
+def apply_fixed_ground_clearance(model, path, clearance=0.05):
+    """Raise every MOT frame by one constant offset so no foot crosses the floor."""
+    path = Path(path)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    header = lines.index("endheader")
+    names = lines[header + 1].split()
+    if "pelvis_ty" not in names:
+        raise ValueError("MOT 缺少地面修正欄位：pelvis_ty")
+    indexes = {name: index for index, name in enumerate(names)}
+    rows = [line.split() for line in lines[header + 2:] if line.strip()]
+    if not rows:
+        raise ValueError("MOT 沒有動作影格")
+    coordinates = model.getCoordinateSet()
+    state = model.initSystem()
+    surfaces = foot_surfaces(model)
+    in_degrees = any(line.strip().lower() == "indegrees=yes" for line in lines[:header])
+    minimum = float("inf")
+    for values in rows:
+        for name, index in indexes.items():
+            if name == "time":
+                continue
+            coordinate = coordinates.get(name)
+            value = float(values[index])
+            if in_degrees and coordinate.getMotionType() == osim.Coordinate.Rotational:
+                value = np.deg2rad(value)
+            coordinate.setValue(state, value, False)
+        model.realizePosition(state)
+        minimum = min(minimum, foot_surface_height(state, surfaces))
+    shift = max(0.0, clearance - minimum)
+    pelvis_ty = indexes["pelvis_ty"]
+    for values in rows:
+        values[pelvis_ty] = f"{float(values[pelvis_ty]) + shift:.8f}"
+    path.write_text("\n".join(lines[:header + 2] + ["\t".join(row) for row in rows]) + "\n", encoding="utf-8")
+    return {"method": "one fixed vertical translation for the full motion",
+            "vertical_shift_m": float(shift), "minimum_surface_y_m": float(minimum + shift),
+            "ground_clearance_m": float(clearance)}
+
+
+def shift_frames_y(frames, shift):
+    return [(time, {name: (x, y + shift, z) for name, (x, y, z) in positions.items()})
+            for time, positions in frames]
+
+
 def scale_trial(static_trc, work_dir):
     frames, quality = prepare_trc(static_trc, work_dir / "processed.trc", static=True)
     offset = compute_ground_offset(frames)
@@ -273,18 +343,20 @@ def ik_trial(motion_trc, calibration_path, work_dir):
     offset = calibration["offset"]
     if len(offset) != 3 or not np.isfinite(offset).all():
         raise ValueError("校正座標無效")
-    write_trc(aligned, apply_offset(frames, offset), fps, names)
+    aligned_frames = apply_offset(frames, offset)
+    write_trc(aligned, aligned_frames, fps, names)
     motion = work_dir / "motion.mot"
     pelvis_reference = pelvis_tilt_reference(osim.Model(str(model)), frames, work_dir / "pelvis_reference.mot")
     setup = build_ik_xml(work_dir, model, aligned, motion, pelvis_reference)
     if not osim.InverseKinematicsTool(setup.name).run():
         raise RuntimeError("OpenSim IK 執行失敗")
     marker_errors = marker_error_summary(work_dir)
-    apply_front_facing_sagittal_correction(motion)
+    ground_correction = apply_fixed_ground_clearance(osim.Model(str(model)), motion)
+    write_trc(work_dir / "processed.trc", shift_frames_y(aligned_frames, ground_correction["vertical_shift_m"]), fps, names)
     validation = validate_motion(motion, [t for t, _ in frames])
     return {"model": str(model), "motion": str(motion), "quality": quality,
             "pelvis_orientation_reference": "RHip/LHip/midHip rigid fit; pelvis_tilt weight=0.1",
-            "sagittal_correction": "front-facing signs corrected; trunk kept upright",
+            "ground_correction": ground_correction,
             "validation": validation, "marker_errors": marker_errors}
 
 

@@ -173,7 +173,7 @@ def write_quality_note(directory, result):
     filled = quality.get("filled_marker_samples", 0)
     lines = [
         "動作品質備註", "",
-        "此資料夾內的 TRC 是實際送入 OpenSim IK 的處理版本。",
+        "此資料夾內的 TRC 與 MOT 使用相同的對齊座標及固定垂直位移。",
         "原始錄影與可用的原始骨架點沒有被改寫；缺失的內部區段使用前後有效三維座標做線性補點。",
         f"補點標記樣本數：{filled}",
         f"最長連續補點時間：{quality.get('max_interpolated_gap_seconds', 0):.3f} 秒",
@@ -187,6 +187,9 @@ def write_quality_note(directory, result):
         lines.append("骨盆傾角以左右髖及骨盆中心三點的逐幀方向作為柔性參考；腰椎未鎖定。此方向仍受 ZED 骨盆點估計誤差影響。")
     if result.get("sagittal_correction"):
         lines.append("已套用正面錄影方向修正，並以腰椎角度抵消骨盆傾斜，使軀幹維持直立；IK 誤差為修正前的標記擬合報告。")
+    if result.get("ground_correction"):
+        ground = result["ground_correction"]
+        lines.append(f"整段動作統一向上平移 {ground['vertical_shift_m'] * 100:.1f} 公分，使最低腳底保持在地面上方 {ground['ground_clearance_m'] * 100:.1f} 公分；沒有逐幀改變高度。")
     gaps = quality.get("interpolated_gaps", [])
     if gaps:
         lines.extend(["", "補點區段："])
