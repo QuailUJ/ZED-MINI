@@ -4,10 +4,10 @@ zed_env/
 __pycache__/
 *.py[cod]
 .analysis/
+legacy_versions/
 .vscode/
 build/
 dist/
-releases/
 
 # Local application state
 .studio_settings.json
@@ -16,6 +16,7 @@ studio_errors.log
 # Camera recordings and generated OpenSim results
 recordings/
 test_data/
+diagnostics/
 motion_data.json
 legacy_scripts/*.json
 legacy_scripts/

@@ -50,11 +50,13 @@ class RecordingWriter:
         if not self.video.isOpened():
             self.video.release()
             raise RuntimeError("無法建立 MP4，請檢查編碼器及輸出位置")
-        self.skeleton = (self.directory / "skeleton.jsonl").open("x", encoding="utf-8")
+        self.skeleton = None
         try:
+            self.skeleton = (self.directory / "skeleton.jsonl").open("x", encoding="utf-8")
             save_json(self.directory / "recording.json", self.meta)
         except Exception:
-            self.skeleton.close()
+            if self.skeleton is not None:
+                self.skeleton.close()
             self.video.release()
             raise
 
@@ -81,6 +83,8 @@ class RecordingWriter:
 
     def finish(self, error=None):
         if self.closed:
+            if self.meta["status"] == "recording":
+                raise RuntimeError(f"錄製未完成保存，請檢查：{self.directory}")
             return self.directory
         self.closed = True
         try:
@@ -92,8 +96,9 @@ class RecordingWriter:
             self.skeleton.close()
         fps = (len(self.frames) - 1) / (self.frames[-1][0] - self.frames[0][0]) if len(self.frames) > 1 else self.fps
         write_trc(self.directory / "raw.trc", self.frames, fps, MARKER_ORDER, camera_rate=self.fps)
-        self.meta.update(status="interrupted" if error else "recorded", error=error,
-                         frames=len(self.frames), video_frames=self.video_frames,
-                         duration=self.frames[-1][0] if self.frames else 0, effective_fps=fps)
-        save_json(self.directory / "recording.json", self.meta)
+        meta = dict(self.meta, status="interrupted" if error else "recorded", error=error,
+                    frames=len(self.frames), video_frames=self.video_frames,
+                    duration=self.frames[-1][0] if self.frames else 0, effective_fps=fps)
+        save_json(self.directory / "recording.json", meta)
+        self.meta = meta
         return self.directory

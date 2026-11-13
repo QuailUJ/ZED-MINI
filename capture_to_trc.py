@@ -28,11 +28,10 @@ def to_opensim_axes(x, y, z):
     """
     ZED's RIGHT_HANDED_Y_UP has X to the camera's right, Y up, Z toward the
     camera/viewer. OpenSim/biomechanics convention wants X forward (the
-    direction the subject faces), Y up, Z to the subject's right. Verified
-    empirically: a subject standing square to the camera should IK to near-0
-    pelvis_tilt/list/rotation; this mapping was the one that did that
-    (previously the axes were off by ~90 degrees, giving nonsense pelvis
-    rotation).
+    initial direction a camera-facing subject faces), Y up, Z to their right.
+    This is a fixed proper rotation, not a per-frame heading correction.
+    WORLD input must use the same initial axis convention; this function does
+    not estimate camera/world attitude or compensate tracking drift.
     """
     return z, y, -x
 

@@ -11,11 +11,12 @@ import queue
 
 import cv2
 import numpy as np
+import opensim as osim
 
 from capture_session import CaptureSession, select_body
 from motion_data import MARKER_ORDER, read_trc, repair_frames, select_static_segment, trim_complete_edges, unique_directory, write_trc
 from recording_io import RecordingWriter
-from run_pipeline import apply_front_facing_sagittal_correction
+from run_pipeline import MARKER_SET_FILE, MODEL_FILE, apply_ground_clearance, clamp_trc_to_ground
 from zed_studio import append_error_log, cleanup_session_data, named_session_directory, next_recording_paths, persist_calibration, publish_file, write_quality_note
 
 
@@ -123,7 +124,8 @@ class DataTests(unittest.TestCase):
             internal, public = next_recording_paths(session, "motion")
             source = internal / "video.mp4"
             source.write_bytes(b"video")
-            publish_file(source, public / f"{public.name}.mp4")
+            with patch('zed_studio.os.link', side_effect=OSError('hard links unavailable')):
+                publish_file(source, public / f"{public.name}.mp4")
             self.assertEqual((public / "action_01.mp4").read_bytes(), b"video")
             cleanup_session_data(session)
             self.assertFalse((session / ".studio").exists())
@@ -163,6 +165,10 @@ class DataTests(unittest.TestCase):
                                   "trimmed_leading_frames": 1, "trimmed_trailing_frames": 2,
                                   "interpolated_gaps": [{"marker": "LHeel", "start": 1., "end": 1.5,
                                                          "seconds": .4, "samples": 4}]},
+                      "ground_correction": {"adjusted_frames": 10, "max_vertical_correction_m": .1,
+                                            "ground_clearance_m": .005},
+                      "trc_ground_correction": {"adjusted_frames": 8, "max_vertical_correction_m": .08,
+                                                "ground_clearance_m": .005},
                       "marker_errors": {"mean_rms_m": .01, "max_error_m": .03}}
             note = write_quality_note(motion, result)
             self.assertEqual(note.name, "action_01-notes.txt")
@@ -170,6 +176,8 @@ class DataTests(unittest.TestCase):
             self.assertIn("線性補點", content)
             self.assertIn("LHeel", content)
             self.assertIn("400", content)
+            self.assertIn("固定垂直位移 80.0 mm", content)
+            self.assertIn("地面不會逐幀追隨腳點", content)
 
     def test_trc_round_trip(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -185,23 +193,33 @@ class DataTests(unittest.TestCase):
         script = "import sys; sys.modules['pyzed']=None; import run_pipeline; assert 'capture_to_trc' not in sys.modules"
         subprocess.run([sys.executable, '-B', '-c', script], cwd=Path(__file__).parent.parent, check=True, capture_output=True)
 
-    def test_front_facing_sagittal_correction(self):
+    def test_ground_clearance_initial_translation(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "motion.mot"
-            names = ["time", "pelvis_tilt", "hip_flexion_r", "hip_flexion_l",
-                     "lumbar_extension", "arm_flex_r", "arm_flex_l", "knee_angle_r"]
-            path.write_text("Coordinates\nendheader\n" + "\t".join(names) +
-                            "\n0\t30\t-20\t-25\t4\t10\t-12\t60\n", encoding="utf-8")
-            apply_front_facing_sagittal_correction(path)
+            names = ["time", "pelvis_tx", "pelvis_ty", "pelvis_tz"]
+            path.write_text("Coordinates\nversion=1\nnRows=1\nnColumns=4\ninDegrees=yes\nendheader\n" +
+                            "\t".join(names) + "\n0\t0\t0\t0\n", encoding="utf-8")
+            model = osim.Model(str(MODEL_FILE))
+            model.updateMarkerSet(osim.MarkerSet(str(MARKER_SET_FILE)))
+            result = apply_ground_clearance(model, path)
             values = [float(value) for value in path.read_text().splitlines()[-1].split()]
-            actual = dict(zip(names, values))
-            self.assertEqual(actual["pelvis_tilt"], -30)
-            self.assertEqual(actual["hip_flexion_r"], 20)
-            self.assertEqual(actual["hip_flexion_l"], 25)
-            self.assertEqual(actual["lumbar_extension"], 30)
-            self.assertEqual(actual["arm_flex_r"], -10)
-            self.assertEqual(actual["arm_flex_l"], 12)
-            self.assertEqual(actual["knee_angle_r"], 60)
+            self.assertGreater(values[2], 0)
+            self.assertEqual(values[1], 0)
+            self.assertEqual(values[3], 0)
+            self.assertGreater(result["initial_translation_m"][1], 0)
+            self.assertGreaterEqual(result["minimum_surface_y_m"], .005 - 1e-6)
+
+    def test_trc_ground_clamp_moves_whole_frame_without_changing_pose(self):
+        positions = {name: (1.0, 2.0, 3.0) for name in MARKER_ORDER}
+        positions["LBigToe"] = (4.0, -0.095, 6.0)
+        grounded, result = clamp_trc_to_ground([(0.0, positions)])
+        moved = grounded[0][1]
+        self.assertAlmostEqual(moved["LBigToe"][1], .005)
+        self.assertAlmostEqual(moved["Neck"][1], 2.1)
+        self.assertEqual(moved["Neck"][0::2], positions["Neck"][0::2])
+        self.assertAlmostEqual(moved["Neck"][1] - moved["LBigToe"][1],
+                               positions["Neck"][1] - positions["LBigToe"][1])
+        self.assertAlmostEqual(result["max_vertical_correction_m"], .1)
 
 
 class RecordingTests(unittest.TestCase):
@@ -248,10 +266,12 @@ class WorkerTests(unittest.TestCase):
         events = queue.Queue()
         worker = CaptureSession(events, ready_seconds=0)
         with tempfile.TemporaryDirectory() as directory:
+            rejected = Path(directory) / 'rejected'
             first, second = Path(directory) / 'first', Path(directory) / 'second'
+            rejected.mkdir()
             first.mkdir()
             second.mkdir()
-            worker.commands.put(('start', (first, 'static')))
+            worker.commands.put(('start', (rejected, 'static')))
             body = SimpleNamespace(id=3, tracking_state=sl.OBJECT_TRACKING_STATE.OK,
                                    keypoint=np.ones((38, 3)), keypoint_2d=np.ones((38, 2)),
                                    keypoint_confidence=np.ones(38) * 100)
@@ -266,11 +286,15 @@ class WorkerTests(unittest.TestCase):
                 def get_timestamp(self, ref): return SimpleNamespace(get_nanoseconds=lambda: 1_000_000_000 + self.index * 33_333_333)
                 def grab(self, params):
                     self.index += 1
+                    if self.index == 1:
+                        return sl.ERROR_CODE.FAILURE
                     if self.index == 3:
+                        worker.commands.put(('start', (first, 'static')))
+                    if self.index == 6:
                         worker.commands.put(('stop', None))
-                    if self.index == 4:
-                        worker.commands.put(('start', (second, 'motion')))
                     if self.index == 7:
+                        worker.commands.put(('start', (second, 'motion')))
+                    if self.index == 10:
                         raise RuntimeError('simulated camera disconnect')
                     return sl.ERROR_CODE.SUCCESS
                 def retrieve_image(self, image, view): return sl.ERROR_CODE.SUCCESS
@@ -287,9 +311,11 @@ class WorkerTests(unittest.TestCase):
             with patch.object(sl, 'Camera', return_value=camera), patch.object(sl, 'Bodies', SimpleNamespace), patch.object(sl, 'Mat', return_value=SimpleNamespace(get_data=lambda: np.zeros((48, 64, 4), np.uint8))):
                 worker.run()
             self.assertTrue(camera.closed)
+            self.assertFalse(any(rejected.iterdir()))
             self.assertEqual(json.loads((first/'recording.json').read_text())['status'], 'recorded')
             self.assertEqual(json.loads((second/'recording.json').read_text())['status'], 'interrupted')
             kinds = [events.get_nowait()[0] for _ in range(events.qsize())]
+            self.assertEqual(kinds.count('start_failed'), 1)
             self.assertIn('recorded', kinds)
             self.assertIn('interrupted', kinds)
             self.assertIn('camera_closed', kinds)

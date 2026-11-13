@@ -85,7 +85,10 @@ class CaptureSession(threading.Thread):
                 raise RuntimeError(f"無法開啟 ZED 相機：{status}")
             opened = True
             self.report_status("相機已開啟，正在啟用位置追蹤…")
-            status = camera.enable_positional_tracking(sl.PositionalTrackingParameters())
+            positional_parameters = sl.PositionalTrackingParameters()
+            positional_parameters.set_floor_as_origin = True
+            positional_parameters.set_gravity_as_origin = True
+            status = camera.enable_positional_tracking(positional_parameters)
             if status != sl.ERROR_CODE.SUCCESS:
                 raise RuntimeError(f"無法啟用位置追蹤：{status}")
             positional = True
@@ -101,8 +104,11 @@ class CaptureSession(threading.Thread):
             tracking = True
             self.report_status("人體追蹤 AI 已啟用，正在等待影像…")
             runtime = sl.RuntimeParameters()
-            runtime.measure3D_reference_frame = sl.REFERENCE_FRAME.CAMERA
+            runtime.measure3D_reference_frame = sl.REFERENCE_FRAME.WORLD
             body_runtime = sl.BodyTrackingRuntimeParameters()
+            body_runtime.detection_confidence_threshold = 40
+            body_runtime.minimum_keypoints_threshold = 20
+            body_runtime.skeleton_smoothing = 0.7
             bodies, image = sl.Bodies(), sl.Mat()
             fps = camera.get_camera_information().camera_configuration.fps or 30
             self.events.put(("camera_ready", None))
@@ -132,6 +138,8 @@ class CaptureSession(threading.Thread):
                 status = camera.grab(runtime)
                 if status != sl.ERROR_CODE.SUCCESS:
                     if pending_start is not None:
+                        pending_start = None
+                        ready_since_ns = ready_body_id = None
                         self.events.put(("start_failed", "相機沒有提供影像，請稍後重試"))
                     if time.monotonic() - last_success > 3:
                         raise RuntimeError(f"相機影像中斷：{status}")
@@ -154,7 +162,7 @@ class CaptureSession(threading.Thread):
                 if body is not None:
                     for marker, index in MARKER_TO_KEYPOINT_INDEX.items():
                         point = body.keypoint[index]
-                        if np.isfinite(point).all() and body.keypoint_confidence[index] > 0:
+                        if np.isfinite(point).all() and body.keypoint_confidence[index] >= 20:
                             positions[marker] = to_opensim_axes(*map(float, point))
                 if pending_start is not None:
                     complete = body is not None and all(marker in positions for marker in MARKER_ORDER)

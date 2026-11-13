@@ -2,6 +2,8 @@
 from pathlib import Path
 import numpy as np
 
+MAX_FRAME_INTERVAL = 0.2 + 1e-8
+
 # ZED BODY_38_PARTS name -> OpenSim marker name (LaiUhlrich2022_markers_openpose.xml).
 # Everything not listed here (spine joints, face, clavicles, sparse finger points)
 # has no counterpart in that marker set and is intentionally dropped.
@@ -60,10 +62,13 @@ def read_trc(trc_path):
         lines = f.readlines()
     if len(lines) < 5:
         raise ValueError("TRC 標頭不完整")
-    if lines[2].split("\t")[4].strip() != "m":
+    metadata = lines[2].split("\t")
+    if len(metadata) < 5:
+        raise ValueError("TRC 標頭不完整")
+    if metadata[4].strip() != "m":
         raise ValueError("目前僅接受單位為 m 的 TRC")
-    fps = float(lines[2].split("\t")[0])
-    n_markers = int(lines[2].split("\t")[3])
+    fps = float(metadata[0])
+    n_markers = int(metadata[3])
     name_tokens = [t for t in lines[3].rstrip("\n").split("\t") if t][2:]
     marker_order = name_tokens[:n_markers]
     if len(marker_order) != n_markers or len(set(marker_order)) != n_markers:
@@ -74,10 +79,12 @@ def read_trc(trc_path):
         if not line.strip():
             continue
         parts = line.rstrip("\n").split("\t")
-        t = float(parts[1])
         vals = parts[2:]
-        if len(vals) != n_markers * 3:
+        if len(parts) < 2 or len(vals) != n_markers * 3:
             raise ValueError("TRC 座標欄位數不符")
+        t = float(parts[1])
+        if not np.isfinite(t) or (frames and t <= frames[-1][0]):
+            raise ValueError("TRC 時間戳記必須有限且嚴格遞增")
         positions = {
             m: (float(vals[i * 3]), float(vals[i * 3 + 1]), float(vals[i * 3 + 2]))
             for i, m in enumerate(marker_order)
@@ -113,13 +120,13 @@ def select_static_segment(frames, markers=MARKER_ORDER, min_duration=0.5):
     best = None
     start = None
     for index, valid in enumerate(np.append(complete, False)):
-        if valid and start is None:
-            start = index
-        elif not valid and start is not None:
+        if start is not None and (not valid or frames[index][0] - frames[index - 1][0] > MAX_FRAME_INTERVAL):
             candidate = (start, index - 1)
             if best is None or frames[candidate[1]][0] - frames[candidate[0]][0] > frames[best[1]][0] - frames[best[0]][0]:
                 best = candidate
             start = None
+        if valid and start is None:
+            start = index
     if best is None or frames[best[1]][0] - frames[best[0]][0] < min_duration:
         longest = 0.0 if best is None else frames[best[1]][0] - frames[best[0]][0]
         raise ValueError(f"找不到至少 {min_duration:.1f} 秒的完整全身站姿（最長 {longest:.2f} 秒），請重新錄製")
@@ -133,6 +140,46 @@ def select_static_segment(frames, markers=MARKER_ORDER, min_duration=0.5):
     }
 
 
+def remove_isolated_spikes(frames, markers=MARKER_ORDER):
+    """Mask isolated out-and-back impulses; never smooth whole trajectories.
+
+    Conservative initial thresholds, in meters: >=15 cm residual and eight
+    robust deviations. Both neighbors must be valid and mutually consistent.
+    Real-data validation is still required; preserve every removed sample.
+    """
+    times = np.array([t for t, _ in frames], dtype=float)
+    values = np.array([[p.get(m, (np.nan,) * 3) for m in markers] for _, p in frames], dtype=float)
+    events = []
+    masked = values.copy()
+    if len(times) >= 3 and np.isfinite(times).all() and np.all(np.diff(times) > 0):
+        intervals = np.diff(times)
+        weights = (intervals[:-1] / (times[2:] - times[:-2]))[:, None]
+        adjacent = (intervals[:-1] <= .1 + 1e-8) & (intervals[1:] <= .1 + 1e-8)
+        for j, marker in enumerate(markers):
+            point = values[:, j]
+            predicted = point[:-2] + weights * (point[2:] - point[:-2])
+            residual = np.linalg.norm(point[1:-1] - predicted, axis=1)
+            finite = residual[np.isfinite(residual)]
+            if not len(finite):
+                continue
+            median = float(np.median(finite))
+            threshold = max(.15, median + 8 * 1.4826 * float(np.median(np.abs(finite - median))))
+            incoming = np.linalg.norm(point[1:-1] - point[:-2], axis=1)
+            outgoing = np.linalg.norm(point[1:-1] - point[2:], axis=1)
+            neighbor = np.linalg.norm(point[2:] - point[:-2], axis=1)
+            candidates = np.flatnonzero((residual > threshold) & (neighbor < .5 * np.minimum(incoming, outgoing)) &
+                                       adjacent) + 1
+            # Consecutive candidates are ambiguous; do not silently interpolate them.
+            selected = [int(i) for i in candidates if i - 1 not in candidates and i + 1 not in candidates]
+            for i in selected:
+                events.append({'marker': marker, 'time': float(times[i]), 'original': point[i].tolist(),
+                               'residual_m': float(residual[i - 1]), 'threshold_m': threshold})
+                masked[i, j] = np.nan
+    output = [(t, {m: tuple(masked[i, j]) for j, m in enumerate(markers)}) for i, (t, _) in enumerate(frames)]
+    return output, {'isolated_spike_samples': len(events), 'isolated_spikes': events,
+                    'spike_policy': 'isolated out-and-back; 0.15m floor, median+8 robust deviations; adjacent dt<=0.1s'}
+
+
 def repair_frames(frames, markers=MARKER_ORDER, max_gap=0.2):
     """Fill bounded gaps only. Do not extrapolate, change timestamps or raw input."""
     if len(frames) < 2:
@@ -141,7 +188,7 @@ def repair_frames(frames, markers=MARKER_ORDER, max_gap=0.2):
     if not np.isfinite(times).all() or np.any(np.diff(times) <= 0):
         raise ValueError("時間戳記必須有限且嚴格遞增")
     intervals = np.diff(times)
-    if np.any(intervals > 0.2 + 1e-8):
+    if np.any(intervals > MAX_FRAME_INTERVAL):
         raise ValueError("相機擷取中斷超過 0.2 秒，請重新錄製")
     sample_period = float(np.median(intervals))
     values = np.array([[p.get(m, (np.nan,) * 3) for m in markers] for _, p in frames], dtype=float)

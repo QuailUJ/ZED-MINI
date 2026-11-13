@@ -26,8 +26,8 @@ from motion_data import unique_directory
 from recording_io import draw_skeleton, save_json
 from voice_control import VoiceControl
 
-RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-PROJECT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else RESOURCE_DIR
+RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).absolute().parent))
+PROJECT = Path(sys.executable).absolute().parent if getattr(sys, "frozen", False) else RESOURCE_DIR
 DIAGNOSTIC_LOG = PROJECT / "studio_diagnostics.log"
 _FAULT_STREAM = None
 
@@ -93,15 +93,8 @@ def named_session_directory(parent, name):
             continue
         if child.name == "session.json" or child.name.startswith(("static_", "motion_", "conversion_")):
             child.replace(system / child.name)
-    if os.name == "nt":
-        attributes = ctypes.windll.kernel32.GetFileAttributesW(str(system))
-        if attributes != 0xFFFFFFFF:
-            ctypes.windll.kernel32.SetFileAttributesW(str(system), attributes | 2)
+    hide_on_windows(system)
     return path
-
-
-def session_metadata_path(session):
-    return Path(session) / ".studio" / "session.json"
 
 
 def saved_calibration_path(session):
@@ -141,19 +134,50 @@ def next_recording_paths(session, kind):
 
 
 def publish_file(source, destination):
-    """Expose one friendly file without duplicating large recording data."""
+    """Publish a complete file, using a hard link where supported."""
     source, destination = Path(source), Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(destination.name + ".tmp")
-    if temporary.exists():
-        temporary.unlink()
-    os.link(source, temporary)
-    os.replace(temporary, destination)
+    temporary.unlink(missing_ok=True)
+    try:
+        try:
+            os.link(source, temporary)
+        except OSError:
+            shutil.copy2(source, temporary)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def cleanup_session_data(session):
-    system = Path(session) / ".studio"
+    session = Path(session)
+    system = session / ".studio"
     if system.is_dir():
+        # Keep diagnostic inputs before deleting disposable conversion scratch.
+        # If any copy fails, propagate the error and leave .studio intact.
+        for recording in system.iterdir():
+            if not recording.is_dir():
+                continue
+            inputs = [recording / name for name in ("raw.trc", "skeleton.jsonl", "recording.json")
+                      if (recording / name).is_file()]
+            video = recording / "video.mp4"
+            if video.is_file() and (recording.name.startswith("motion_") or not (recording / "raw.trc").is_file()):
+                action = recording.name.replace("motion_", "action_", 1)
+                published_video = session / action / f"{action}.mp4"
+                if not published_video.is_file():
+                    inputs.append(video)
+            if not inputs:
+                continue
+            archive = unique_directory(session / "diagnostics", recording.name)
+            for source in inputs:
+                shutil.copy2(source, archive / source.name)
+            for result in recording.rglob("result.json"):
+                destination = archive / result.parent.relative_to(recording)
+                destination.mkdir(parents=True, exist_ok=True)
+                for name in ("result.json", "model.osim", "calibration.json"):
+                    source = result.with_name(name)
+                    if source.is_file():
+                        shutil.copy2(source, destination / name)
         shutil.rmtree(system)
 
 
@@ -173,7 +197,8 @@ def write_quality_note(directory, result):
     filled = quality.get("filled_marker_samples", 0)
     lines = [
         "動作品質備註", "",
-        "此資料夾內的 TRC 與 MOT 使用相同的對齊座標及固定垂直位移。",
+        "程式修訂：source-quality-20261106（尚待實機驗證）。",
+        "此資料夾內的 TRC 是 IK 輸入加上與 MOT 相同的固定全身平移，保留兩者空間對應。",
         "原始錄影與可用的原始骨架點沒有被改寫；缺失的內部區段使用前後有效三維座標做線性補點。",
         f"補點標記樣本數：{filled}",
         f"最長連續補點時間：{quality.get('max_interpolated_gap_seconds', 0):.3f} 秒",
@@ -185,11 +210,31 @@ def write_quality_note(directory, result):
                       f"IK 最大標記誤差：{errors['max_error_m'] * 1000:.1f} mm"])
     if result.get("pelvis_orientation_reference"):
         lines.append("骨盆傾角以左右髖及骨盆中心三點的逐幀方向作為柔性參考；腰椎未鎖定。此方向仍受 ZED 骨盆點估計誤差影響。")
-    if result.get("sagittal_correction"):
-        lines.append("已套用正面錄影方向修正，並以腰椎角度抵消骨盆傾斜，使軀幹維持直立；IK 誤差為修正前的標記擬合報告。")
-    if result.get("ground_correction"):
-        ground = result["ground_correction"]
-        lines.append(f"整段動作統一向上平移 {ground['vertical_shift_m'] * 100:.1f} 公分，使最低腳底保持在地面上方 {ground['ground_clearance_m'] * 100:.1f} 公分；沒有逐幀改變高度。")
+    lines.append("保留 IK 原始關節角度；不事後反號、不強制腰椎挺直。")
+    lines.append("原始 TRC 與逐幀骨架於正常關閉時保存到工作階段 diagnostics 子資料夾；原始 MP4 未改寫。")
+    spikes = quality.get('isolated_spikes', [])
+    lines.append(f"已標記並線性修補孤立突波：{len(spikes)} 個點樣本。此偵測門檻仍待實錄驗證。")
+    lines.extend(f"- 突波 {s['marker']}：{s['time']:.3f} 秒，偏離前後軌跡 {s['residual_m'] * 1000:.1f} mm" for s in spikes)
+    warnings = result.get('validation', {}).get('continuity_warnings', [])
+    lines.append(f"最終角度連續性警告：{len(warnings)} 筆（保留角度，未自動裁切）。")
+    lines.extend(f"- {w['coordinate']}：{w['time']:.3f} 秒，{w['reason']}" for w in warnings)
+    ground = result.get("ground_correction")
+    trc_ground = result.get("trc_ground_correction")
+    if trc_ground:
+        lines.append("每段動作以第一個有效影格的骨盆中心 X/Z 與最低腳部標記 Y 建立自己的原點；靜態校正提供身體比例。")
+        lines.append(
+            f"IK 前已對整段 TRC 套用固定垂直位移 "
+            f"{trc_ground['max_vertical_correction_m'] * 1000:.1f} mm；地面不會逐幀追隨腳點。"
+        )
+    if ground:
+        shift = ground.get("initial_translation_m", [0, 0, 0])
+        lines.append(
+            f"MOT 起始全身平移 XYZ（公尺）：{shift}。"
+            f"此固定平移會讓第一幀足部模型表面位於地面上方 {ground['ground_clearance_m'] * 1000:.0f} mm。"
+        )
+        lines.append("地面在整段動作中保持固定，不會因腳點抖動把人體逐幀抬高；此為播放位置修正，不是物理碰撞或接觸力計算。需從腳接觸支撐面的姿勢開始錄製。IK 誤差為所有 MOT 後處理之前的結果。")
+        if 'minimum_surface_y_m' in ground:
+            lines.append(f"全段最低足部表面 Y：{ground['minimum_surface_y_m'] * 1000:.1f} mm。負值表示仍有沉入地面的影格，需回放檢查。")
     gaps = quality.get("interpolated_gaps", [])
     if gaps:
         lines.extend(["", "補點區段："])
@@ -214,13 +259,36 @@ def photo(image, width, height):
     return ImageTk.PhotoImage(result)
 
 
+def draw_recording_timer(image, elapsed):
+    """Draw an easy-to-read recording clock directly on the camera preview."""
+    if elapsed is None:
+        return
+    elapsed = max(0.0, float(elapsed))
+    text = f"REC {int(elapsed // 60):02d}:{elapsed % 60:04.1f}"
+    scale = max(1.0, min(image.shape[:2]) / 500)
+    thickness = max(2, round(scale * 2))
+    (text_width, text_height), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+    margin = max(14, round(scale * 12))
+    dot_radius = max(7, round(scale * 7))
+    left, top = margin, margin
+    right = left + margin + dot_radius * 2 + text_width + margin
+    bottom = top + margin + text_height + baseline + margin
+    overlay = image.copy()
+    cv2.rectangle(overlay, (left, top), (right, bottom), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.65, image, 0.35, 0, image)
+    center_y = top + (bottom - top) // 2
+    cv2.circle(image, (left + margin + dot_radius, center_y), dot_radius, (0, 0, 255), -1)
+    cv2.putText(image, text, (left + margin + dot_radius * 2 + margin, top + margin + text_height),
+                cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+
 class FirstRunGuide(tk.Toplevel):
     STEPS = [
         ("歡迎｜先認識操作順序", "整個流程分成三步：\n\n① 先錄一段靜態站姿，建立這個人的模型。\n② 再錄動作，按結束後自動計算動作結果。\n③ 回放影片，隨時切換是否顯示骨架。\n\n沒有相機也能閱讀教學、開啟既有錄製回放。現在不需要連接相機。"),
         ("1｜準備相機與工作階段", "程式啟動後會自動連接相機；請新增或開啟工作階段。\n\n• 固定相機，保持水平，避免錄到一半移動。\n• 受測者面向相機，全身、雙腳都要入鏡。\n• 開始錄製時，畫面中只留一名受測者。\n\n沒有偵測到相機時，程式會顯示提示，可按「連接相機」重試；教學及回放仍可使用。"),
         ("2｜先做靜態校正", "按「開始靜態校正錄製」後走到鏡頭前。\n程式會等到單一受測者的全身標記連續完整，才正式開始錄影。保持靜止數秒，再按「結束錄製並轉換」；走回電腦造成的尾段缺失會在分析資料中裁掉。\n\n等到顯示「靜態校正：已完成」，才能錄動作。工作階段外層會產生同名 OSIM。\n\n同一個人、相機位置不變時可以共用這次校正；換人或移動相機後請新增工作階段並重新校正。"),
-        ("3｜錄製動作與保存結果", "按「開始動作錄製」，完成動作後按「結束錄製並轉換」。\n由你手動決定錄多久，不會在 10 秒時自動停止。\n\n每段動作各自保存同名 MP4、TRC、MOT。動作缺失一秒內會補點，超過 0.2 秒時完成訊息會顯示品質警告；超過一秒才停止轉換。"),
-        ("4｜回放與遇到問題時怎麼做", "本次程式開啟期間，可選取清單中的錄製並按「回放選取錄製」，用播放／暫停、時間軸與「顯示骨架」檢查。\n\n程式正常關閉後只保留乾淨成果：OSIM，以及每段動作的 MP4、TRC、MOT；支援回放與重新轉換的暫存資料會刪除。轉換失敗時，詳細內容會追加到 OSIM 旁的同一份錯誤日誌。\n\n之後可隨時按主畫面「使用教學」再看一次。"),
+        ("3｜錄製動作與保存結果", "按「開始動作錄製」，完成動作後按「結束錄製並轉換」。\n由你手動決定錄多久，不會在 10 秒時自動停止。\n\n每段動作各自保存同名 MP4、TRC、MOT。內部缺失仍以線性補點處理，超過 0.2 秒顯示品質警告；孤立大突波也會標記並修補。最終模型角度超限會停止轉換，疑似角度抽動會留下警告。請查看 notes，補點不等於真實量測。"),
+        ("4｜回放與遇到問題時怎麼做", "本次程式開啟期間，可選取清單中的錄製並按「回放選取錄製」，用播放／暫停、時間軸與「顯示骨架」檢查。\n\n程式正常關閉後只保留乾淨成果：OSIM，以及每段動作的 MP4、TRC、MOT；原始 TRC、逐幀骨架與轉換結果會先保存至工作階段的 diagnostics，再清理暫存。這些資料供查錯，不會自動上傳；目前介面仍未提供匯入診斷檔重新轉換的按鈕。轉換失敗時，詳細內容會追加到 OSIM 旁的同一份錯誤日誌。\n\n之後可隨時按主畫面「使用教學」再看一次。"),
     ]
 
     def __init__(self, parent):
@@ -391,7 +459,7 @@ class Playback(tk.Toplevel):
 class Studio(tk.Tk):
     def __init__(self, *, settings_path=None, show_guide=None, enable_voice=True, auto_connect=True):
         super().__init__()
-        self.title("ZED MINI 動作錄製工作室")
+        self.title("ZED MINI 動作錄製工作室｜source-quality-20261106")
         # At this size the inner preview is 1136x639 (16:9), so the full
         # camera frame and every control fit without preview letterboxing.
         self.geometry("1160x1060")
@@ -416,8 +484,7 @@ class Studio(tk.Tk):
         self.session = None
         self.calibration = None
         self.live_static_directory = None
-        self.current = None
-        self.publish_targets = {}
+        self.publish_target = None
         self.job = None
         self.live_bones = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value="請建立工作階段並連接 ZED 相機。")
@@ -564,7 +631,6 @@ class Studio(tk.Tk):
         self.live_static_directory = None
         self.session_label.set(f"工作階段：{self.session.name}")
         self.calibration_label.set("靜態校正：尚未完成")
-        save_json(session_metadata_path(self.session), {"version": 1, "name": self.session.name, "calibration": None})
         self.status.set("請先錄製靜態站姿；相機需保持水平及固定。")
         self.update_controls()
 
@@ -572,8 +638,8 @@ class Studio(tk.Tk):
         path = filedialog.askdirectory(title="選擇既有工作階段", initialdir=PROJECT / "recordings", parent=self)
         if not path:
             return
-        session = Path(path).resolve()
-        if session.parent != (PROJECT / "recordings").resolve():
+        session = Path(path).absolute()
+        if session.parent.resolve() != (PROJECT / "recordings").resolve():
             messagebox.showerror("無法開啟工作階段", "請選擇 recordings 內的工作階段資料夾。", parent=self)
             return
         system = session / ".studio"
@@ -590,8 +656,6 @@ class Studio(tk.Tk):
         else:
             self.calibration_label.set("靜態校正：尚未完成，請重新錄製")
             self.status.set("既有工作階段已開啟，但沒有可沿用的校正；請先錄製靜態站姿。")
-        save_json(session_metadata_path(session), {"version": 1, "name": session.name,
-                                                   "calibration": str(self.calibration) if self.calibration else None})
         self.update_controls()
 
     def connect(self):
@@ -603,8 +667,6 @@ class Studio(tk.Tk):
         self.live_static_directory = None
         if self.calibration is None:
             self.calibration_label.set("靜態校正：尚未完成")
-            if self.session is not None:
-                save_json(session_metadata_path(self.session), {"version": 1, "name": self.session.name, "calibration": None})
         self.camera = CaptureSession(self.events, logger=diagnostic)
         self.camera.start()
         diagnostic("Camera worker started")
@@ -614,15 +676,13 @@ class Studio(tk.Tk):
     def start(self, kind):
         if self.session is None or not self.camera_ready or self.state != "idle":
             return
-        self.current, published = next_recording_paths(self.session, kind)
-        self.publish_targets[str(self.current.resolve())] = published
+        directory, self.publish_target = next_recording_paths(self.session, kind)
         self.state = "starting"
         if kind == "static":
             self.calibration = None
-            self.live_static_directory = self.current
+            self.live_static_directory = directory
             self.calibration_label.set("靜態校正：等待重新錄製")
-            save_json(session_metadata_path(self.session), {"version": 1, "name": self.session.name, "calibration": None})
-        self.camera.commands.put(("start", (self.current, kind)))
+        self.camera.commands.put(("start", (directory, kind)))
         self.status.set("等待單一受測者的全身標記連續完整；就位後才會正式開始錄製…")
         self.update_controls()
 
@@ -636,7 +696,7 @@ class Studio(tk.Tk):
         self.update_controls()
 
     def add_recording(self, directory):
-        directory = Path(directory).resolve()
+        directory = Path(directory).absolute()
         meta = json.loads((directory / "recording.json").read_text(encoding="utf-8"))
         key = str(directory)
         labels = {"recorded": "已保存", "interrupted": "錄製中斷", "recording": "錄製中"}
@@ -686,6 +746,13 @@ class Studio(tk.Tk):
         try:
             meta = json.loads((directory / "recording.json").read_text(encoding="utf-8"))
             calibration = meta.get("calibration")
+            last_conversion = meta.get("last_conversion")
+            if meta["kind"] == "motion" and last_conversion:
+                snapshot = Path(last_conversion) / "calibration.json"
+                if snapshot.is_file():
+                    saved_model = json.loads(snapshot.read_text(encoding="utf-8"))["model"]
+                    if (snapshot.parent / saved_model).is_file():
+                        calibration = snapshot
             if meta["kind"] == "motion" and (not calibration or not Path(calibration).is_file()):
                 calibration = filedialog.askopenfilename(title="選擇該次錄製對應的 calibration.json", filetypes=[("校正設定", "*.json")])
                 if not calibration:
@@ -753,10 +820,11 @@ class Studio(tk.Tk):
             result = json.loads((output / "result.json").read_text(encoding="utf-8"))
             if code != 0 or result["status"] != "complete":
                 raise ValueError(result.get("error", "轉換程序失敗"))
-            if mode == "scale" and activate and self.camera_ready:
-                self.calibration = persist_calibration(self.session, result)
-                self.calibration_label.set("靜態校正：已完成，可開始動作錄製")
-                save_json(session_metadata_path(self.session), {"version": 1, "name": self.session.name, "calibration": str(self.calibration)})
+            if mode == "scale" and activate:
+                saved = persist_calibration(self.session, result)
+                if self.camera_ready:
+                    self.calibration = saved
+                    self.calibration_label.set("靜態校正：已完成，可開始動作錄製")
             elif mode == "ik":
                 meta = json.loads((directory / "recording.json").read_text(encoding="utf-8"))
                 published = Path(meta["published_dir"])
@@ -770,6 +838,9 @@ class Studio(tk.Tk):
                 detail += f" 已使用 {duration:.2f} 秒完整站姿。"
             if result["quality"].get("quality_warning"):
                 detail += f" 品質警告：最長補點 {result['quality']['max_interpolated_gap_seconds']:.2f} 秒。"
+                detail += f" 孤立突波 {result['quality'].get('isolated_spike_samples', 0)} 點；角度連續性警告 {len(result.get('validation', {}).get('continuity_warnings', []))} 筆，請查看備註。"
+                if result['quality'].get('foot_surface_warning'):
+                    detail += ' 部分足部表面低於地面，已記錄備註。'
             if mode == "ik":
                 error = result["marker_errors"]
                 detail += f" IK 平均 RMS {error['mean_rms_m'] * 1000:.1f} mm，最大誤差 {error['max_error_m'] * 1000:.1f} mm。"
@@ -782,9 +853,10 @@ class Studio(tk.Tk):
                 if not source.is_file():
                     source = directory / f"{output.name}.log"
                 label = f"{'動作' if meta['kind'] == 'motion' else '靜態'}轉換失敗：{Path(meta.get('published_dir', directory)).name}"
-                append_error_log(self.session, label, source, exc)
-            except Exception:
-                pass
+                session = directory.parent.parent if directory.parent.name == ".studio" else self.session
+                append_error_log(session, label, source, exc)
+            except Exception as log_exc:
+                diagnostic(f"無法追加工作階段錯誤日誌：{log_exc}")
             self.status.set(f"轉換未完成：{exc}。原始資料已保留；詳細日誌位於錄製資料夾。")
         finally:
             self.cancelled = False
@@ -804,21 +876,22 @@ class Studio(tk.Tk):
             self.status.set("錄製中；按「結束錄製並轉換」完成。")
         elif event == "voice_ready":
             self.voice_status.set("語音控制：可用（開始錄製／開始靜態錄製／結束錄製）")
-        elif event == "voice_command":
+        elif event == "voice_command" and self.voice_enabled.get() and not self.closing:
             self.handle_voice_command(value)
         elif event == "voice_error":
             self.voice_enabled.set(False)
             self.voice_status.set(f"語音控制：無法啟動（{value}）")
         elif event == "start_failed":
             self.state = "idle"
+            self.publish_target = None
             self.status.set(value)
         elif event in ("recorded", "interrupted"):
             self.state = "idle"
+            published, self.publish_target = self.publish_target, None
             directory = Path(value)
             meta = self.add_recording(directory)
             if meta["kind"] == "motion" and self.calibration is not None:
                 meta["calibration"] = str(self.calibration)
-                published = self.publish_targets.get(str(directory.resolve()))
                 if published is not None:
                     published.mkdir(parents=True, exist_ok=True)
                     meta["published_dir"] = str(published)
@@ -834,6 +907,7 @@ class Studio(tk.Tk):
             self.status.set(value)
             if event == "camera_error":
                 self.camera_ready = False
+                self.publish_target = None
                 self.calibration = None
                 self.live_static_directory = None
                 self.calibration_label.set("靜態校正：相機中斷後需重錄")
@@ -881,6 +955,7 @@ class Studio(tk.Tk):
                 frame = frame.copy()
                 if self.live_bones.get():
                     draw_skeleton(frame, points, bones)
+                draw_recording_timer(frame, elapsed)
                 self.image = photo(frame, self.preview.winfo_width(), self.preview.winfo_height())
                 self.preview.configure(image=self.image, text="")
                 tracking = f"有效人數：{count}　追蹤 ID：{body_id if body_id is not None else '缺失'}"

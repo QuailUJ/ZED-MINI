@@ -90,8 +90,8 @@ class PlaybackSource(threading.Thread):
                 if target is None or target == decoded:
                     continue
                 target = max(0, min(count - 1, target))
-                if target != decoded + 1:
-                    capture.set(cv2.CAP_PROP_POS_FRAMES, target)
+                if target != decoded + 1 and not capture.set(cv2.CAP_PROP_POS_FRAMES, target):
+                    raise ValueError(f"影片無法定位到第 {target + 1} 幀")
                 ok, frame = capture.read()
                 if not ok:
                     raise ValueError(f"第 {target + 1} 幀讀取失敗，影片可能不完整")

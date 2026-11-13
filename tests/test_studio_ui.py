@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -67,6 +68,10 @@ class DecoderTests(unittest.TestCase):
             self.source.request(20)
             self.wait_frame(20)
             self.assertEqual(spy.set.call_count, 1)
+            spy.set.return_value = False
+            self.source.request(5)
+            self.assertEqual(self.source.events.get(timeout=3)[0], "error")
+            self.assertIsNone(self.source.take_frame())
             self.source.close()
             self.source.join(3)
         spy.release.assert_called_once()
@@ -185,18 +190,18 @@ class GuiTests(unittest.TestCase):
             return capture.read()
         spy.read.side_effect = slow_read
         beats = []
-        running = True
+        heartbeat_id = None
         def heartbeat():
-            if running and not self.app.destroyed:
-                beats.append(time.monotonic())
-                self.app.after(10, heartbeat)
+            nonlocal heartbeat_id
+            beats.append(time.monotonic())
+            heartbeat_id = self.app.after(10, heartbeat)
         with patch("playback_source.cv2.VideoCapture", return_value=spy):
             heartbeat()
             player = Playback(self.app, directory)
             player.withdraw()
             self.players.append(player)
             self.pump(lambda: player.last_index == 0)
-            running = False
+            self.app.after_cancel(heartbeat_id)
             player.close()
             player.source.join(3)
         self.assertGreater(len(beats), 10)
@@ -223,3 +228,29 @@ class GuiTests(unittest.TestCase):
         self.pump(lambda: self.app.process is None)
         self.assertEqual(json.loads((output / "result.json").read_text())["status"], "cancelled")
         self.assertEqual((directory / "raw.trc").read_bytes(), raw)
+
+    def test_close_during_completed_scale_saves_calibrated_model(self):
+        self.app.session = self.path / "01"
+        directory = self.app.session / ".studio" / "static_01"
+        directory.parent.mkdir(parents=True)
+        make_recording(directory)
+        self.app.add_recording(directory)
+        output = directory / "conversion"
+        output.mkdir()
+        model = output / "model.osim"
+        model.write_bytes(b"scaled model")
+        calibration = output / "calibration.json"
+        calibration.write_text(json.dumps({"model": model.name, "offset": [0, 0, 0]}))
+        (output / "result.json").write_text(json.dumps({
+            "status": "complete", "model": str(model), "calibration": str(calibration),
+            "quality": {"filled_marker_samples": 0, "selected_static_start": 0., "selected_static_end": 1.},
+        }))
+        self.app.process_log = (directory / "process.log").open("w")
+        self.app.process = SimpleNamespace(poll=lambda: 0, returncode=0)
+        self.app.job = (directory, output, "scale", True)
+        self.app.close()
+        self.pump(lambda: self.app.destroyed)
+        self.assertEqual((self.app.session / "01.osim").read_bytes(), b"scaled model")
+        archived = list((self.app.session / "diagnostics").rglob("model.osim"))
+        self.assertEqual(len(archived), 1)
+        self.assertEqual(archived[0].read_bytes(), b"scaled model")
